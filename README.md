@@ -1,12 +1,41 @@
 # Credit_Union_Scrape
-This repo is for python scripts used to scrape data from NCUA quarterly call reports for credit unions and download them with headers on your laptop.
 
-## What data is it retrieving?
-These files consist of the quarterly Call Report financial and miscellaneous information from natural person credit unions available from March 1994. Each quarter’s Zip file has comma delimited text files that can be easily imported into a spreadsheet or database program.
+This repo contains ingestion tooling for NCUA quarterly call report data.
 
-## How does it work?
-The script takes a couple of inputs in the first section. You need to specify the start_year and end_year values. These values will determine the range of years you want to retreive data for.
+## What It Retrieves
 
-The end output is a csv file that you can use to analyze data about credit unions
+`ingest_ncua_call_report.py` downloads and merges all available `FS220*` schedules for each requested quarter, not only `FS220.txt`.
 
-Enjoy!
+- Primary output: one wide CSV with maximal column coverage across schedules.
+- Secondary output: raw rows from multi-record schedules (for example historical `FS220CUSO`) so no detail is silently lost.
+
+## Why This Version
+
+The previous workflow only pulled `FS220.txt` and missed most available NCUA call report columns.  
+The new workflow:
+
+- Discovers quarter ZIP URLs directly from NCUA's quarterly data page (supports historical link patterns back to 1994).
+- Merges all `FS220*` tables by `CU_NUMBER`, `CYCLE_DATE`, `JOIN_NUMBER`.
+- Handles duplicate-key schedules by collapsing into the wide dataset and also exporting raw multi-record rows.
+- Uses an inclusive year range (`start_year` through `end_year`).
+
+## Usage
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run ingestion:
+
+```bash
+python ingest_ncua_call_report.py --start-year 1994 --end-year 2026
+```
+
+Optional arguments:
+
+- `--output-file` (default: `NCUA_Call_Report.csv`)
+- `--multirecord-output-file` (default: `NCUA_Call_Report_Multirecord.csv`)
+- `--keep-temp-files` (keeps intermediate per-quarter files)
+- `--resume-from-temp` (reuses existing `.ncua_quarter_temp` quarter files and only backfills missing quarters)
