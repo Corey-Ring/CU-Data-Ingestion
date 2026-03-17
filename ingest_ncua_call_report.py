@@ -626,9 +626,13 @@ def iter_quarter_dataframes(
                     for col in df.columns
                 ]
 
+            # Show a sample column so the user can verify names
+            acct_cols = [c for c in df.columns if "ACCT_" in c.upper()]
+            sample = acct_cols[0] if acct_cols else "(no ACCT cols)"
             print(
                 f"  OK: {quarter} -> "
                 f"{df.shape[0]:,} rows x {df.shape[1]:,} cols"
+                f"  (e.g. {sample})"
             )
             total_yielded += 1
             yield quarter, df
