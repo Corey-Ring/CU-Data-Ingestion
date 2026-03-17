@@ -615,10 +615,14 @@ def iter_quarter_dataframes(
         try:
             df = _process_quarter_to_dataframe(quarter, data)
 
-            # Rename columns to descriptive names
+            # Rename ACCT_* columns to descriptive names; leave
+            # metadata columns (CU_NUMBER, CYCLE_DATE, …) untouched
+            # so downstream MERGE keys stay predictable.
             if not raw_column_names and global_account_name_map:
                 df.columns = [
                     format_column_name(col, global_account_name_map)
+                    if col.startswith("ACCT_")
+                    else col
                     for col in df.columns
                 ]
 
