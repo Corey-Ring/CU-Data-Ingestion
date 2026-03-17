@@ -520,13 +520,22 @@ def iter_quarter_dataframes(
     end_year: int,
     download_workers: int = 8,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    raw_column_names: bool = False,
 ):
     """Yield ``(quarter, dataframe)`` for each successfully processed quarter.
 
-    Downloads are batched to *download_workers* quarters at a time so that
-    peak memory stays bounded to roughly ``download_workers`` ZIP payloads
-    plus one processed DataFrame.  Quarters are yielded in chronological
-    order within each batch.
+    All requested quarters are downloaded in parallel first.  Then the
+    account-description files from every ZIP are merged into a single
+    global name map so that column names are **consistent** across all
+    quarters (e.g. ``ACCT_007 - Total Assets``).  Finally each quarter
+    is parsed, columns renamed, and yielded one at a time so that peak
+    memory stays at roughly one processed DataFrame.
+
+    Parameters
+    ----------
+    raw_column_names : bool
+        If *True*, columns keep their raw ``ACCT_007`` form instead of
+        being formatted with descriptive names.
     """
     requested = build_requested_quarters(start_year, end_year)
     ssl_ctx = ssl.create_default_context()
@@ -541,54 +550,90 @@ def iter_quarter_dataframes(
             "Using fallback URLs."
         )
 
-    batch_size = download_workers
-    total_yielded = 0
+    # ------------------------------------------------------------------
+    # Phase 1: Download ALL quarters in parallel
+    # ------------------------------------------------------------------
+    print(
+        f"\nDownloading {len(requested)} quarters "
+        f"with {download_workers} workers …"
+    )
+    payloads: dict[str, tuple[bytes | None, str]] = {}
+    with ThreadPoolExecutor(max_workers=download_workers) as pool:
+        futures = {
+            pool.submit(
+                download_quarter,
+                q,
+                quarter_urls.get(
+                    q, FALLBACK_URL_TEMPLATE.format(quarter=q)
+                ),
+                ssl_ctx,
+            ): q
+            for q in requested
+        }
+        done_count = 0
+        for future in as_completed(futures):
+            quarter, data, err_msg = future.result()
+            payloads[quarter] = (data, err_msg)
+            done_count += 1
+            if done_count % 10 == 0 or done_count == len(requested):
+                print(f"  … downloaded {done_count}/{len(requested)}")
 
-    for batch_start in range(0, len(requested), batch_size):
-        batch = requested[batch_start : batch_start + batch_size]
-        print(
-            f"\nDownloading batch {batch_start // batch_size + 1} "
-            f"({len(batch)} quarters) with {download_workers} workers …"
-        )
+    downloaded = sum(1 for d, _ in payloads.values() if d is not None)
+    print(f"Downloaded {downloaded}/{len(requested)} quarters.\n")
 
-        # -- Download batch in parallel --
-        payloads: dict[str, tuple[bytes | None, str]] = {}
-        with ThreadPoolExecutor(max_workers=download_workers) as pool:
-            futures = {
-                pool.submit(
-                    download_quarter,
-                    q,
-                    quarter_urls.get(
-                        q, FALLBACK_URL_TEMPLATE.format(quarter=q)
-                    ),
-                    ssl_ctx,
-                ): q
-                for q in batch
-            }
-            for future in as_completed(futures):
-                quarter, data, err_msg = future.result()
-                payloads[quarter] = (data, err_msg)
-
-        # -- Process and yield each quarter in chronological order --
-        for quarter in batch:
-            data, err_msg = payloads[quarter]
+    # ------------------------------------------------------------------
+    # Phase 2: Build a global account-name map from ALL ZIPs
+    # ------------------------------------------------------------------
+    global_account_name_map: dict[str, str] = {}
+    if not raw_column_names:
+        for quarter in requested:
+            data, _ = payloads[quarter]
             if data is None:
-                print(f"  SKIP: {quarter} -> {err_msg}")
                 continue
             try:
-                df = _process_quarter_to_dataframe(quarter, data)
-                print(
-                    f"  OK: {quarter} -> "
-                    f"{df.shape[0]:,} rows x {df.shape[1]:,} cols"
-                )
-                total_yielded += 1
-                yield quarter, df
-                del df
-            except Exception as exc:  # noqa: BLE001
-                print(f"  ERROR: {quarter} -> {type(exc).__name__}: {exc}")
-            finally:
-                payloads[quarter] = (None, "")  # free ZIP payload
-                gc.collect()
+                with ZipFile(BytesIO(data)) as zf:
+                    acct_map = load_account_name_map(zf)
+                    for code, name in acct_map.items():
+                        if name:
+                            global_account_name_map[code] = name
+            except Exception:  # noqa: BLE001
+                pass
+        print(
+            f"Built account name map with "
+            f"{len(global_account_name_map)} entries."
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 3: Process and yield one quarter at a time
+    # ------------------------------------------------------------------
+    total_yielded = 0
+    for quarter in requested:
+        data, err_msg = payloads[quarter]
+        if data is None:
+            print(f"  SKIP: {quarter} -> {err_msg}")
+            continue
+        try:
+            df = _process_quarter_to_dataframe(quarter, data)
+
+            # Rename columns to descriptive names
+            if not raw_column_names and global_account_name_map:
+                df.columns = [
+                    format_column_name(col, global_account_name_map)
+                    for col in df.columns
+                ]
+
+            print(
+                f"  OK: {quarter} -> "
+                f"{df.shape[0]:,} rows x {df.shape[1]:,} cols"
+            )
+            total_yielded += 1
+            yield quarter, df
+            del df
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ERROR: {quarter} -> {type(exc).__name__}: {exc}")
+        finally:
+            payloads[quarter] = (None, "")  # free ZIP payload
+            gc.collect()
 
     print(
         f"\nDone. Yielded {total_yielded}/{len(requested)} "
