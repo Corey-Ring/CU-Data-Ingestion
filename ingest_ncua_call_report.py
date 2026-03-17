@@ -448,6 +448,155 @@ def _process_quarter_payload(
 
 
 # ---------------------------------------------------------------------------
+# Lightweight quarter processing (no temp files, no multirecord tracking)
+# ---------------------------------------------------------------------------
+def _process_quarter_to_dataframe(
+    quarter: str, payload: bytes
+) -> pd.DataFrame:
+    """Parse one quarter's ZIP *payload* and return the merged FS220 DataFrame.
+
+    Unlike :func:`_process_quarter_payload` this keeps everything in memory
+    and skips multirecord tracking / temp‑file I/O.
+    """
+    with ZipFile(BytesIO(payload)) as zf:
+        schedule_files = sorted(
+            [
+                name
+                for name in zf.namelist()
+                if FS220_TABLE_PATTERN.match(Path(name).name)
+            ],
+            key=str.lower,
+        )
+        if not schedule_files:
+            raise FileNotFoundError(
+                "No FS220 schedule files found in quarter zip."
+            )
+
+        quarter_tables: list[tuple[str, pd.DataFrame]] = []
+        for schedule_file in schedule_files:
+            with zf.open(schedule_file) as handle:
+                table_df = read_ncua_csv(handle)
+            table_df = normalize_dataframe_columns(table_df)
+
+            missing_keys = [
+                key for key in KEY_COLUMNS if key not in table_df.columns
+            ]
+            if missing_keys:
+                print(
+                    f"    SKIP TABLE: {quarter} {schedule_file} "
+                    f"missing keys {missing_keys}"
+                )
+                continue
+
+            duplicate_rows = table_df.duplicated(
+                subset=list(KEY_COLUMNS)
+            ).sum()
+            if duplicate_rows:
+                table_df = collapse_multi_record_table(
+                    table_df, key_columns=KEY_COLUMNS
+                )
+                print(
+                    f"    COLLAPSED: {quarter} {schedule_file} "
+                    f"{duplicate_rows} duplicate‑key rows aggregated."
+                )
+
+            quarter_tables.append((schedule_file, table_df))
+
+        if not quarter_tables:
+            raise ValueError(
+                "No mergeable FS220 tables were found in this quarter."
+            )
+
+        return merge_quarter_tables(
+            quarter_tables, key_columns=KEY_COLUMNS
+        )
+
+
+# ---------------------------------------------------------------------------
+# Generator: yield one quarter DataFrame at a time (for incremental writes)
+# ---------------------------------------------------------------------------
+def iter_quarter_dataframes(
+    start_year: int,
+    end_year: int,
+    download_workers: int = 8,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+):
+    """Yield ``(quarter, dataframe)`` for each successfully processed quarter.
+
+    Downloads are batched to *download_workers* quarters at a time so that
+    peak memory stays bounded to roughly ``download_workers`` ZIP payloads
+    plus one processed DataFrame.  Quarters are yielded in chronological
+    order within each batch.
+    """
+    requested = build_requested_quarters(start_year, end_year)
+    ssl_ctx = ssl.create_default_context()
+
+    quarter_urls: dict[str, str] = {}
+    try:
+        quarter_urls = discover_quarter_urls(ssl_ctx)
+        print(f"Discovered {len(quarter_urls)} quarter links from NCUA page.")
+    except Exception as err:  # noqa: BLE001
+        print(
+            f"WARN: Could not discover quarter links ({err}). "
+            "Using fallback URLs."
+        )
+
+    batch_size = download_workers
+    total_yielded = 0
+
+    for batch_start in range(0, len(requested), batch_size):
+        batch = requested[batch_start : batch_start + batch_size]
+        print(
+            f"\nDownloading batch {batch_start // batch_size + 1} "
+            f"({len(batch)} quarters) with {download_workers} workers …"
+        )
+
+        # -- Download batch in parallel --
+        payloads: dict[str, tuple[bytes | None, str]] = {}
+        with ThreadPoolExecutor(max_workers=download_workers) as pool:
+            futures = {
+                pool.submit(
+                    download_quarter,
+                    q,
+                    quarter_urls.get(
+                        q, FALLBACK_URL_TEMPLATE.format(quarter=q)
+                    ),
+                    ssl_ctx,
+                ): q
+                for q in batch
+            }
+            for future in as_completed(futures):
+                quarter, data, err_msg = future.result()
+                payloads[quarter] = (data, err_msg)
+
+        # -- Process and yield each quarter in chronological order --
+        for quarter in batch:
+            data, err_msg = payloads[quarter]
+            if data is None:
+                print(f"  SKIP: {quarter} -> {err_msg}")
+                continue
+            try:
+                df = _process_quarter_to_dataframe(quarter, data)
+                print(
+                    f"  OK: {quarter} -> "
+                    f"{df.shape[0]:,} rows x {df.shape[1]:,} cols"
+                )
+                total_yielded += 1
+                yield quarter, df
+                del df
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ERROR: {quarter} -> {type(exc).__name__}: {exc}")
+            finally:
+                payloads[quarter] = (None, "")  # free ZIP payload
+                gc.collect()
+
+    print(
+        f"\nDone. Yielded {total_yielded}/{len(requested)} "
+        f"requested quarters."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 def run_ingestion(
@@ -460,7 +609,8 @@ def run_ingestion(
     raw_column_names: bool = False,
     download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> dict[str, str] | None:
+    return_dataframe: bool = False,
+) -> "pd.DataFrame | dict[str, str] | None":
     """Download and merge NCUA call‑report data.
 
     Parameters
@@ -483,13 +633,18 @@ def run_ingestion(
         Number of parallel threads for downloading quarter ZIPs.
     max_retries : int
         Max HTTP retry attempts per quarter download.
+    return_dataframe : bool
+        If *True*, return the assembled pandas DataFrame directly instead
+        of writing a final CSV.  This avoids filesystem access entirely,
+        which is required on Databricks serverless compute.
 
     Returns
     -------
-    dict[str, str] | None
-        The global account‑name mapping (code -> description) when
-        *raw_column_names* is True so callers can build their own reference
-        table.  Returns *None* when no data was retrieved.
+    pd.DataFrame | dict[str, str] | None
+        When *return_dataframe* is True, returns the assembled DataFrame.
+        When *raw_column_names* is True (and *return_dataframe* is False),
+        returns the global account‑name mapping.
+        Returns *None* when no data was retrieved.
     """
     requested_quarters = build_requested_quarters(
         start_year=start_year, end_year=end_year
@@ -620,6 +775,48 @@ def run_ingestion(
             for column in final_columns
         ]
 
+    # -- Helper: cleanup temp files --
+    def _cleanup():
+        if cleanup_temp_files:
+            for _, qtp in quarter_temp_files:
+                if qtp.exists():
+                    qtp.unlink()
+            if quarter_temp_dir.exists() and not any(quarter_temp_dir.iterdir()):
+                quarter_temp_dir.rmdir()
+
+    # -- Return in-memory DataFrame (for Databricks serverless) --
+    if return_dataframe:
+        chunks = []
+        for _, quarter_temp_path in quarter_temp_files:
+            quarter_df = pd.read_csv(quarter_temp_path, low_memory=False)
+            quarter_df = quarter_df.reindex(columns=final_columns)
+            quarter_df.columns = final_headers
+            chunks.append(quarter_df)
+            del quarter_df
+        result_df = (
+            pd.concat(chunks, ignore_index=True)
+            if chunks
+            else pd.DataFrame(columns=final_headers)
+        )
+        del chunks
+        gc.collect()
+        _cleanup()
+
+        print(
+            f"\nDone. Retrieved {len(successful)}/{len(requested_quarters)} "
+            f"requested quarters."
+        )
+        print(
+            f"Assembled {len(result_df):,} rows x "
+            f"{len(result_df.columns):,} columns in memory."
+        )
+        if failed:
+            print("Missing/failed quarters:")
+            for quarter, reason in failed:
+                print(f"  - {quarter}: {reason}")
+        return result_df
+
+    # -- Write final CSV to disk --
     output_path = Path(output_file)
     if output_path.exists():
         output_path.unlink()
@@ -657,13 +854,7 @@ def run_ingestion(
         del multi_df
         gc.collect()
 
-    # -- Cleanup --
-    if cleanup_temp_files:
-        for _, quarter_temp_path in quarter_temp_files:
-            if quarter_temp_path.exists():
-                quarter_temp_path.unlink()
-        if quarter_temp_dir.exists() and not any(quarter_temp_dir.iterdir()):
-            quarter_temp_dir.rmdir()
+    _cleanup()
 
     print()
     print(
