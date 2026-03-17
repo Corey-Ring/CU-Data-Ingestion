@@ -15,8 +15,10 @@ Changes from original
 import argparse
 import csv
 import gc
+import random
 import re
 import ssl
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -54,7 +56,7 @@ FILE_CANDIDATES_ACCT_DESC = ("AcctDesc.txt", "Acct_Desc.txt", "Acct_Des.txt")
 USER_AGENT = "Mozilla/5.0 (compatible; NCUA-Ingestion/2.1)"
 
 # Retry / concurrency defaults
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 DEFAULT_DOWNLOAD_WORKERS = 4
 
 
@@ -111,32 +113,67 @@ def fetch_with_retry(
     url: str,
     ssl_ctx: ssl.SSLContext,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    rate_limiter: "threading.Semaphore | None" = None,
 ) -> bytes:
-    """Download *url* with exponential back‑off on transient errors."""
+    """Download *url* with exponential back‑off on transient errors.
+
+    - 404 errors are raised immediately (no retry) since they indicate
+      a quarter that genuinely doesn't exist.
+    - 429 errors use longer backoff with jitter to respect rate limits.
+    - A *rate_limiter* semaphore can throttle concurrent requests.
+    """
     for attempt in range(max_retries):
+        # Throttle: acquire permit, then add a small stagger so threads
+        # don't all fire the instant a permit is released.
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+            time.sleep(random.uniform(0.2, 0.8))
         try:
             request = Request(url, headers={"User-Agent": USER_AGENT})
             with urlopen(request, context=ssl_ctx, timeout=120) as response:
                 return response.read()
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise  # quarter doesn't exist — no point retrying
             if attempt == max_retries - 1:
                 raise
-            wait = 2**attempt * 5  # 5 s, 10 s, 20 s
+            # Respect Retry-After header if present, otherwise backoff
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after and retry_after.isdigit():
+                wait = int(retry_after) + random.uniform(0.5, 2.0)
+            elif exc.code == 429:
+                wait = 2**attempt * 8 + random.uniform(1, 5)
+            else:
+                wait = 2**attempt * 5 + random.uniform(0.5, 2)
             print(
                 f"  Retry {attempt + 1}/{max_retries} for {url} "
-                f"after {wait}s ({exc})"
+                f"after {wait:.0f}s ({exc})"
             )
             time.sleep(wait)
-    # Unreachable, but keeps type checkers happy.
+        except (URLError, TimeoutError, OSError) as exc:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2**attempt * 5 + random.uniform(0.5, 2)
+            print(
+                f"  Retry {attempt + 1}/{max_retries} for {url} "
+                f"after {wait:.0f}s ({exc})"
+            )
+            time.sleep(wait)
+        finally:
+            if rate_limiter is not None:
+                rate_limiter.release()
     raise RuntimeError("fetch_with_retry exhausted retries")
 
 
 def download_quarter(
-    quarter: str, url: str, ssl_ctx: ssl.SSLContext
+    quarter: str,
+    url: str,
+    ssl_ctx: ssl.SSLContext,
+    rate_limiter: "threading.Semaphore | None" = None,
 ) -> tuple[str, bytes | None, str]:
     """Download a single quarter ZIP. Returns (quarter, payload | None, error)."""
     try:
-        payload = fetch_with_retry(url, ssl_ctx)
+        payload = fetch_with_retry(url, ssl_ctx, rate_limiter=rate_limiter)
         return (quarter, payload, "")
     except Exception as exc:  # noqa: BLE001
         return (quarter, None, f"{type(exc).__name__}: {exc}")
@@ -551,8 +588,11 @@ def iter_quarter_dataframes(
         )
 
     # ------------------------------------------------------------------
-    # Phase 1: Download ALL quarters in parallel
+    # Phase 1: Download ALL quarters in parallel (rate-limited)
     # ------------------------------------------------------------------
+    # Allow at most 2 concurrent in-flight HTTP requests to avoid 429s,
+    # even if more thread workers are available for I/O overlap.
+    rate_limiter = threading.Semaphore(2)
     print(
         f"\nDownloading {len(requested)} quarters "
         f"with {download_workers} workers …"
@@ -567,6 +607,7 @@ def iter_quarter_dataframes(
                     q, FALLBACK_URL_TEMPLATE.format(quarter=q)
                 ),
                 ssl_ctx,
+                rate_limiter,
             ): q
             for q in requested
         }
@@ -760,6 +801,7 @@ def run_ingestion(
 
     # -- Download in parallel, process sequentially --
     if quarters_to_download:
+        rate_limiter = threading.Semaphore(2)
         print(
             f"Downloading {len(quarters_to_download)} quarters "
             f"with {download_workers} workers …"
@@ -775,6 +817,7 @@ def run_ingestion(
                         q, FALLBACK_URL_TEMPLATE.format(quarter=q)
                     ),
                     ssl_ctx,
+                    rate_limiter,
                 ): q
                 for q in quarters_to_download
             }
