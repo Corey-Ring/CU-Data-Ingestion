@@ -15,8 +15,10 @@ Changes from original
 import argparse
 import csv
 import gc
+import random
 import re
 import ssl
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -54,7 +56,7 @@ FILE_CANDIDATES_ACCT_DESC = ("AcctDesc.txt", "Acct_Desc.txt", "Acct_Des.txt")
 USER_AGENT = "Mozilla/5.0 (compatible; NCUA-Ingestion/2.1)"
 
 # Retry / concurrency defaults
-DEFAULT_MAX_RETRIES = 3
+DEFAULT_MAX_RETRIES = 5
 DEFAULT_DOWNLOAD_WORKERS = 4
 
 
@@ -111,32 +113,67 @@ def fetch_with_retry(
     url: str,
     ssl_ctx: ssl.SSLContext,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    rate_limiter: "threading.Semaphore | None" = None,
 ) -> bytes:
-    """Download *url* with exponential back‑off on transient errors."""
+    """Download *url* with exponential back‑off on transient errors.
+
+    - 404 errors are raised immediately (no retry) since they indicate
+      a quarter that genuinely doesn't exist.
+    - 429 errors use longer backoff with jitter to respect rate limits.
+    - A *rate_limiter* semaphore can throttle concurrent requests.
+    """
     for attempt in range(max_retries):
+        # Throttle: acquire permit, then add a small stagger so threads
+        # don't all fire the instant a permit is released.
+        if rate_limiter is not None:
+            rate_limiter.acquire()
+            time.sleep(random.uniform(0.2, 0.8))
         try:
             request = Request(url, headers={"User-Agent": USER_AGENT})
             with urlopen(request, context=ssl_ctx, timeout=120) as response:
                 return response.read()
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        except HTTPError as exc:
+            if exc.code == 404:
+                raise  # quarter doesn't exist — no point retrying
             if attempt == max_retries - 1:
                 raise
-            wait = 2**attempt * 5  # 5 s, 10 s, 20 s
+            # Respect Retry-After header if present, otherwise backoff
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after and retry_after.isdigit():
+                wait = int(retry_after) + random.uniform(0.5, 2.0)
+            elif exc.code == 429:
+                wait = 2**attempt * 8 + random.uniform(1, 5)
+            else:
+                wait = 2**attempt * 5 + random.uniform(0.5, 2)
             print(
                 f"  Retry {attempt + 1}/{max_retries} for {url} "
-                f"after {wait}s ({exc})"
+                f"after {wait:.0f}s ({exc})"
             )
             time.sleep(wait)
-    # Unreachable, but keeps type checkers happy.
+        except (URLError, TimeoutError, OSError) as exc:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2**attempt * 5 + random.uniform(0.5, 2)
+            print(
+                f"  Retry {attempt + 1}/{max_retries} for {url} "
+                f"after {wait:.0f}s ({exc})"
+            )
+            time.sleep(wait)
+        finally:
+            if rate_limiter is not None:
+                rate_limiter.release()
     raise RuntimeError("fetch_with_retry exhausted retries")
 
 
 def download_quarter(
-    quarter: str, url: str, ssl_ctx: ssl.SSLContext
+    quarter: str,
+    url: str,
+    ssl_ctx: ssl.SSLContext,
+    rate_limiter: "threading.Semaphore | None" = None,
 ) -> tuple[str, bytes | None, str]:
     """Download a single quarter ZIP. Returns (quarter, payload | None, error)."""
     try:
-        payload = fetch_with_retry(url, ssl_ctx)
+        payload = fetch_with_retry(url, ssl_ctx, rate_limiter=rate_limiter)
         return (quarter, payload, "")
     except Exception as exc:  # noqa: BLE001
         return (quarter, None, f"{type(exc).__name__}: {exc}")
@@ -448,6 +485,212 @@ def _process_quarter_payload(
 
 
 # ---------------------------------------------------------------------------
+# Lightweight quarter processing (no temp files, no multirecord tracking)
+# ---------------------------------------------------------------------------
+def _process_quarter_to_dataframe(
+    quarter: str, payload: bytes
+) -> pd.DataFrame:
+    """Parse one quarter's ZIP *payload* and return the merged FS220 DataFrame.
+
+    Unlike :func:`_process_quarter_payload` this keeps everything in memory
+    and skips multirecord tracking / temp‑file I/O.
+    """
+    with ZipFile(BytesIO(payload)) as zf:
+        schedule_files = sorted(
+            [
+                name
+                for name in zf.namelist()
+                if FS220_TABLE_PATTERN.match(Path(name).name)
+            ],
+            key=str.lower,
+        )
+        if not schedule_files:
+            raise FileNotFoundError(
+                "No FS220 schedule files found in quarter zip."
+            )
+
+        quarter_tables: list[tuple[str, pd.DataFrame]] = []
+        for schedule_file in schedule_files:
+            with zf.open(schedule_file) as handle:
+                table_df = read_ncua_csv(handle)
+            table_df = normalize_dataframe_columns(table_df)
+
+            missing_keys = [
+                key for key in KEY_COLUMNS if key not in table_df.columns
+            ]
+            if missing_keys:
+                print(
+                    f"    SKIP TABLE: {quarter} {schedule_file} "
+                    f"missing keys {missing_keys}"
+                )
+                continue
+
+            duplicate_rows = table_df.duplicated(
+                subset=list(KEY_COLUMNS)
+            ).sum()
+            if duplicate_rows:
+                table_df = collapse_multi_record_table(
+                    table_df, key_columns=KEY_COLUMNS
+                )
+                print(
+                    f"    COLLAPSED: {quarter} {schedule_file} "
+                    f"{duplicate_rows} duplicate‑key rows aggregated."
+                )
+
+            quarter_tables.append((schedule_file, table_df))
+
+        if not quarter_tables:
+            raise ValueError(
+                "No mergeable FS220 tables were found in this quarter."
+            )
+
+        return merge_quarter_tables(
+            quarter_tables, key_columns=KEY_COLUMNS
+        )
+
+
+# ---------------------------------------------------------------------------
+# Generator: yield one quarter DataFrame at a time (for incremental writes)
+# ---------------------------------------------------------------------------
+def iter_quarter_dataframes(
+    start_year: int,
+    end_year: int,
+    download_workers: int = 8,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    raw_column_names: bool = False,
+):
+    """Yield ``(quarter, dataframe)`` for each successfully processed quarter.
+
+    All requested quarters are downloaded in parallel first.  Then the
+    account-description files from every ZIP are merged into a single
+    global name map so that column names are **consistent** across all
+    quarters (e.g. ``ACCT_007 - Total Assets``).  Finally each quarter
+    is parsed, columns renamed, and yielded one at a time so that peak
+    memory stays at roughly one processed DataFrame.
+
+    Parameters
+    ----------
+    raw_column_names : bool
+        If *True*, columns keep their raw ``ACCT_007`` form instead of
+        being formatted with descriptive names.
+    """
+    requested = build_requested_quarters(start_year, end_year)
+    ssl_ctx = ssl.create_default_context()
+
+    quarter_urls: dict[str, str] = {}
+    try:
+        quarter_urls = discover_quarter_urls(ssl_ctx)
+        print(f"Discovered {len(quarter_urls)} quarter links from NCUA page.")
+    except Exception as err:  # noqa: BLE001
+        print(
+            f"WARN: Could not discover quarter links ({err}). "
+            "Using fallback URLs."
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1: Download ALL quarters in parallel (rate-limited)
+    # ------------------------------------------------------------------
+    # Allow at most 2 concurrent in-flight HTTP requests to avoid 429s,
+    # even if more thread workers are available for I/O overlap.
+    rate_limiter = threading.Semaphore(2)
+    print(
+        f"\nDownloading {len(requested)} quarters "
+        f"with {download_workers} workers …"
+    )
+    payloads: dict[str, tuple[bytes | None, str]] = {}
+    with ThreadPoolExecutor(max_workers=download_workers) as pool:
+        futures = {
+            pool.submit(
+                download_quarter,
+                q,
+                quarter_urls.get(
+                    q, FALLBACK_URL_TEMPLATE.format(quarter=q)
+                ),
+                ssl_ctx,
+                rate_limiter,
+            ): q
+            for q in requested
+        }
+        done_count = 0
+        for future in as_completed(futures):
+            quarter, data, err_msg = future.result()
+            payloads[quarter] = (data, err_msg)
+            done_count += 1
+            if done_count % 10 == 0 or done_count == len(requested):
+                print(f"  … downloaded {done_count}/{len(requested)}")
+
+    downloaded = sum(1 for d, _ in payloads.values() if d is not None)
+    print(f"Downloaded {downloaded}/{len(requested)} quarters.\n")
+
+    # ------------------------------------------------------------------
+    # Phase 2: Build a global account-name map from ALL ZIPs
+    # ------------------------------------------------------------------
+    global_account_name_map: dict[str, str] = {}
+    if not raw_column_names:
+        for quarter in requested:
+            data, _ = payloads[quarter]
+            if data is None:
+                continue
+            try:
+                with ZipFile(BytesIO(data)) as zf:
+                    acct_map = load_account_name_map(zf)
+                    for code, name in acct_map.items():
+                        if name:
+                            global_account_name_map[code] = name
+            except Exception:  # noqa: BLE001
+                pass
+        print(
+            f"Built account name map with "
+            f"{len(global_account_name_map)} entries."
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 3: Process and yield one quarter at a time
+    # ------------------------------------------------------------------
+    total_yielded = 0
+    for quarter in requested:
+        data, err_msg = payloads[quarter]
+        if data is None:
+            print(f"  SKIP: {quarter} -> {err_msg}")
+            continue
+        try:
+            df = _process_quarter_to_dataframe(quarter, data)
+
+            # Rename ACCT_* columns to descriptive names; leave
+            # metadata columns (CU_NUMBER, CYCLE_DATE, …) untouched
+            # so downstream MERGE keys stay predictable.
+            if not raw_column_names and global_account_name_map:
+                df.columns = [
+                    format_column_name(col, global_account_name_map)
+                    if col.startswith("ACCT_")
+                    else col
+                    for col in df.columns
+                ]
+
+            # Show a sample column so the user can verify names
+            acct_cols = [c for c in df.columns if "ACCT_" in c.upper()]
+            sample = acct_cols[0] if acct_cols else "(no ACCT cols)"
+            print(
+                f"  OK: {quarter} -> "
+                f"{df.shape[0]:,} rows x {df.shape[1]:,} cols"
+                f"  (e.g. {sample})"
+            )
+            total_yielded += 1
+            yield quarter, df
+            del df
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ERROR: {quarter} -> {type(exc).__name__}: {exc}")
+        finally:
+            payloads[quarter] = (None, "")  # free ZIP payload
+            gc.collect()
+
+    print(
+        f"\nDone. Yielded {total_yielded}/{len(requested)} "
+        f"requested quarters."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 def run_ingestion(
@@ -460,7 +703,8 @@ def run_ingestion(
     raw_column_names: bool = False,
     download_workers: int = DEFAULT_DOWNLOAD_WORKERS,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> dict[str, str] | None:
+    return_dataframe: bool = False,
+) -> "pd.DataFrame | dict[str, str] | None":
     """Download and merge NCUA call‑report data.
 
     Parameters
@@ -483,13 +727,18 @@ def run_ingestion(
         Number of parallel threads for downloading quarter ZIPs.
     max_retries : int
         Max HTTP retry attempts per quarter download.
+    return_dataframe : bool
+        If *True*, return the assembled pandas DataFrame directly instead
+        of writing a final CSV.  This avoids filesystem access entirely,
+        which is required on Databricks serverless compute.
 
     Returns
     -------
-    dict[str, str] | None
-        The global account‑name mapping (code -> description) when
-        *raw_column_names* is True so callers can build their own reference
-        table.  Returns *None* when no data was retrieved.
+    pd.DataFrame | dict[str, str] | None
+        When *return_dataframe* is True, returns the assembled DataFrame.
+        When *raw_column_names* is True (and *return_dataframe* is False),
+        returns the global account‑name mapping.
+        Returns *None* when no data was retrieved.
     """
     requested_quarters = build_requested_quarters(
         start_year=start_year, end_year=end_year
@@ -552,6 +801,7 @@ def run_ingestion(
 
     # -- Download in parallel, process sequentially --
     if quarters_to_download:
+        rate_limiter = threading.Semaphore(2)
         print(
             f"Downloading {len(quarters_to_download)} quarters "
             f"with {download_workers} workers …"
@@ -567,6 +817,7 @@ def run_ingestion(
                         q, FALLBACK_URL_TEMPLATE.format(quarter=q)
                     ),
                     ssl_ctx,
+                    rate_limiter,
                 ): q
                 for q in quarters_to_download
             }
@@ -620,6 +871,48 @@ def run_ingestion(
             for column in final_columns
         ]
 
+    # -- Helper: cleanup temp files --
+    def _cleanup():
+        if cleanup_temp_files:
+            for _, qtp in quarter_temp_files:
+                if qtp.exists():
+                    qtp.unlink()
+            if quarter_temp_dir.exists() and not any(quarter_temp_dir.iterdir()):
+                quarter_temp_dir.rmdir()
+
+    # -- Return in-memory DataFrame (for Databricks serverless) --
+    if return_dataframe:
+        chunks = []
+        for _, quarter_temp_path in quarter_temp_files:
+            quarter_df = pd.read_csv(quarter_temp_path, low_memory=False)
+            quarter_df = quarter_df.reindex(columns=final_columns)
+            quarter_df.columns = final_headers
+            chunks.append(quarter_df)
+            del quarter_df
+        result_df = (
+            pd.concat(chunks, ignore_index=True)
+            if chunks
+            else pd.DataFrame(columns=final_headers)
+        )
+        del chunks
+        gc.collect()
+        _cleanup()
+
+        print(
+            f"\nDone. Retrieved {len(successful)}/{len(requested_quarters)} "
+            f"requested quarters."
+        )
+        print(
+            f"Assembled {len(result_df):,} rows x "
+            f"{len(result_df.columns):,} columns in memory."
+        )
+        if failed:
+            print("Missing/failed quarters:")
+            for quarter, reason in failed:
+                print(f"  - {quarter}: {reason}")
+        return result_df
+
+    # -- Write final CSV to disk --
     output_path = Path(output_file)
     if output_path.exists():
         output_path.unlink()
@@ -657,13 +950,7 @@ def run_ingestion(
         del multi_df
         gc.collect()
 
-    # -- Cleanup --
-    if cleanup_temp_files:
-        for _, quarter_temp_path in quarter_temp_files:
-            if quarter_temp_path.exists():
-                quarter_temp_path.unlink()
-        if quarter_temp_dir.exists() and not any(quarter_temp_dir.iterdir()):
-            quarter_temp_dir.rmdir()
+    _cleanup()
 
     print()
     print(
